@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Redis for the Kuma Counter Demo
+Parameters:
+  VPCStackName:
+    Type: String
+    Description: Stack used to create the VPC
+  CPStackName:
+    Type: String
+    Description: Cloudformation stack used to provision the control plane.
+  SidecarImage:
+    Type: String
+    Default: "docker.io/kong/kuma-dp:2.8.0"
+    Description: Name of the kuma-dp docker image
+  DesiredCount:
+    Type: String
+    Default: 1
+    Description: Desired replica count of the workload
+  AllowedCidr:
+    Type: String
+    Default: "10.0.0.0/8"
+    Description: CIDR used to restrict the kuma-cp ports access
+  DataplaneSecretPrefix:
+    Type: String
+    Default: "kong-mesh-ecs"
+    Description: Prefix to use for naming dataplane token secrets
+
+Mappings:
+  Config:
+    Sidecar:
+      Mesh: default
+      Template: |
+        ---
+        type: Dataplane
+        name: "{{ dpname }}"
+        mesh: "{{ mesh }}"
+        networking:
+          address: "{{ address }}"
+          inbound:
+          - port: {{ port }}
+            servicePort: {{ servicePort }}
+            tags:
+              kuma.io/service: "{{ service }}"
+              kuma.io/protocol: "{{ protocol }}"
+          outbound:
+          - port: {{ redisPort }}
+            tags:
+              kuma.io/service: redis
+      # kuma.io/service: redis_kuma-demo_svc_6379    
+    Workload:
+      # Our demo-app listens on this port
+      Port: 5000
+      # The port we want to expose to our mesh
+      ExternalPort: 15000
+      # The port we want to contact redis on
+      RedisPort: 6379
+      Image:  "thefosk/kuma-demo"
+      Name: demo-app
+Resources:
+  DPTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Secret containing Kuma Dataplane Token
+      Name: !Join ["/", [!Ref DataplaneSecretPrefix, !FindInMap [Config, Workload, Name]]]
+      SecretString: "{}"
+
+  LoadBalancerTargetDemoApp:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Port: !FindInMap [Config, Workload, ExternalPort]
+      Protocol: TCP
+      VpcId:
+        Fn::ImportValue: !Join [":", [!Ref VPCStackName, VPCId]]
+
+  LoadBalancerListenerDemoApp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn:
+        Fn::ImportValue: !Join [":", [!Ref VPCStackName, LoadBalancer]]
+      Port: 80
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref LoadBalancerTargetDemoApp
+
+  WorkloadTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Action: [sts:AssumeRole]
+      Policies:
+        - PolicyName: get-kuma-dp-token-secret
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DPTokenSecret
+                  - Fn::ImportValue: !Join [":", [!Ref CPStackName, CPCASecret]]
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  WorkloadTaskIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ecs-tasks.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/AWSAppMeshEnvoyAccess
+      Tags:
+        - Key: kuma.io/type
+          Value: dataplane
+        - Key: kuma.io/mesh
+          Value: default
+        - Key: kuma.io/service
+          Value: !FindInMap [Config, Workload, Name]
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref AWS::StackName
+      RetentionInDays: 7
+
+  WorkloadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: kuma-cp security group
+      SecurityGroupIngress:
+        - CidrIp: "10.0.0.0/8"
+          IpProtocol: tcp
+          ToPort: !FindInMap [Config, Workload, ExternalPort]
+          FromPort: !FindInMap [Config, Workload, ExternalPort]
+      VpcId:
+        Fn::ImportValue: !Join [":", [!Ref VPCStackName, VPCId]]
+   
+  WorkloadSecurityIngressTcp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress for demo-app
+      GroupId: !Ref WorkloadSecurityGroup
+      IpProtocol: tcp
+      CidrIp: !Ref AllowedCidr
+      FromPort: 5000
+      ToPort: 5000
+
+  ServiceWorkload:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      Cluster:
+        Fn::ImportValue: !Join [":", [!Ref "VPCStackName", "ClusterName"]]
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref "TaskDefinitionWorkload"
+      LoadBalancers:
+        - TargetGroupArn: !Ref LoadBalancerTargetDemoApp
+          ContainerPort: !FindInMap [Config, Workload, ExternalPort]
+          ContainerName: kuma-dp
+      PropagateTags: SERVICE
+      Tags:
+        - Key: kuma.io/service
+          Value: !FindInMap [Config, Workload, Name]
+      ServiceName: !FindInMap [Config, Workload, Name]
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - Fn::ImportValue:
+                !Join [":", [!Ref "VPCStackName", "PublicSubnet"]]
+          SecurityGroups: [!Ref "WorkloadSecurityGroup"]
+
+  TaskDefinitionWorkload:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !FindInMap [Config, Workload, Name]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Ref WorkloadTaskIamRole
+      ExecutionRoleArn: !Ref "WorkloadTaskExecutionRole"
+      Cpu: 256
+      Memory: 512
+      ContainerDefinitions:
+        - Name: workload
+          Essential: true
+          Image: !FindInMap [Config, Workload, Image]
+          Environment:
+            - Name: REDIS_HOST
+              Value: 127.0.0.1
+            - Name: REDIS_PORT
+              Value: !FindInMap [Config, Workload, RedisPort]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AWS::StackName
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: workload
+        - Name: kuma-dp
+          Image: !Ref SidecarImage
+          PortMappings:
+            - ContainerPort: !FindInMap [Config, Workload, ExternalPort]
+              Protocol: tcp
+          Essential: true
+          User: "5678"
+          Secrets:
+            - Name: KUMA_CONTROL_PLANE_CA_CERT
+              ValueFrom:
+                Fn::ImportValue: !Join [":", [!Ref CPStackName, CPCASecret]]
+          Environment:
+            - Name: KUMA_DATAPLANE_RUNTIME_RESOURCE
+              Value: !FindInMap [Config, Sidecar, Template]
+          EntryPoint: ["sh", "-c"]
+          Command:
+            - !Join
+              - " "
+              - - kuma-dp
+                - run
+                - --cp-address
+                - Fn::Sub:
+                    - https://${Hostname}:5678
+                    - Hostname:
+                        Fn::ImportValue:
+                          !Join [":", [!Ref CPStackName, CPAddress]]
+                - --dataplane-var
+                - dpname=`hostname -s`
+                - --dataplane-var
+                - address=`hostname -i`
+                - --dataplane-var
+                - !Join ["=", [mesh, !FindInMap [Config, Sidecar, Mesh]]]
+                - --dataplane-var
+                - !Join ["=", [port, !FindInMap [Config, Workload, ExternalPort]]]
+                - --dataplane-var
+                - !Join ["=", [servicePort, !FindInMap [Config, Workload, Port]]]
+                - --dataplane-var
+                - !Join ["=", [service, !FindInMap [Config, Workload, Name]]]
+                - --dataplane-var
+                - !Join ["=", [redisPort, !FindInMap [Config, Workload, RedisPort]]]
+                - --dataplane-var
+                - !Join ["=", [protocol, http]]
+                - --auth-type=aws
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AWS::StackName
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: kuma-dp
